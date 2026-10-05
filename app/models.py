@@ -1,9 +1,9 @@
 """请求 / 响应数据模型与输入校验。"""
 import math
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # 温度的合理物理范围（°C），超出即视为无效温度
 MIN_TEMPERATURE = -273.15
@@ -57,6 +57,75 @@ class CorrectionIn(BaseModel):
         return _validate_temperature(v)
 
 
+class DisputeIn(BaseModel):
+    """争议申请请求体。
+
+    - action=correct：必须携带 sampled_at 与 temperature（目标采样时间 / 温度）；
+    - action=revoke：不得携带 sampled_at / temperature（申请撤销整条例外读数）；
+    - reason 必填且非空白，作为处理争议的依据。
+    """
+
+    action: Literal["correct", "revoke"]
+    reason: str = Field(min_length=1, max_length=1000)
+    dispute_no: str = Field(
+        description="设备内唯一争议号（字母 / 数字 / `.` `_` `-`，≤ 64 字符）",
+        pattern=EVENT_NO_PATTERN,
+    )
+    target_event_no: str = Field(pattern=EVENT_NO_PATTERN)
+    sampled_at: Optional[datetime] = None
+    temperature: Optional[float] = None
+
+    @field_validator("reason")
+    @classmethod
+    def reason_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("reason must not be blank")
+        return v
+
+    @field_validator("temperature")
+    @classmethod
+    def temperature_plausible(cls, v: Optional[float]) -> Optional[float]:
+        if v is None:
+            return v
+        return _validate_temperature(v)
+
+    @model_validator(mode="after")
+    def payload_matches_action(self):
+        if self.action == "correct":
+            missing = [
+                name for name in ("sampled_at", "temperature")
+                if getattr(self, name) is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"action 'correct' requires non-null fields: {', '.join(missing)}"
+                )
+        else:  # revoke：目标字段必须缺省，避免“撤销但又带目标值”的歧义
+            extra = [
+                name for name in ("sampled_at", "temperature")
+                if getattr(self, name) is not None
+            ]
+            if extra:
+                raise ValueError(
+                    f"action 'revoke' must not carry fields: {', '.join(extra)}"
+                )
+        return self
+
+
+class DecisionIn(BaseModel):
+    """争议决定请求体：approve（批准）或 reject（驳回），reason 可选。"""
+
+    decision: Literal["approve", "reject"]
+    reason: Optional[str] = Field(default=None, max_length=1000)
+
+    @field_validator("reason")
+    @classmethod
+    def reason_not_blank(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not v.strip():
+            raise ValueError("reason must not be blank")
+        return v
+
+
 class Interval(BaseModel):
     """超温区间。以起点读数的事件号为标识；未结束时终点字段为空。"""
 
@@ -97,3 +166,60 @@ class ReadingOut(BaseModel):
 class ReadingsResponse(BaseModel):
     device_id: str
     readings: List[ReadingOut]
+
+
+class DisputeExecution(BaseModel):
+    """争议决定的执行结果（终态后随争议一起返回，重放时原样回传首次结果）。"""
+
+    outcome: Literal["applied", "rejected", "expired"] = Field(
+        description="applied=批准已按规则执行；rejected=驳回未改读数；expired=过期未改读数"
+    )
+    applied: bool = Field(description="是否真正改写了读数（仅 applied 为 true）")
+    detail: Optional[str] = Field(default=None, description="过期 / 驳回的原因说明")
+    intervals: List[Interval] = Field(
+        default_factory=list,
+        description="决定生效时点该设备的全部有效超温区间",
+    )
+    changes: IntervalChanges = Field(
+        description="本次决定引起的区间差异（未改读数时三个列表均为空）"
+    )
+
+
+class DisputeOut(BaseModel):
+    """争议对象：含冻结依据、终态与执行结果。"""
+
+    device_id: str
+    dispute_no: str
+    target_event_no: str
+    action: Literal["correct", "revoke"]
+    reason: str
+    target_sampled_at: Optional[str] = Field(
+        default=None, description="action=correct 时申请写入的采样时间"
+    )
+    target_temperature: Optional[float] = Field(
+        default=None, description="action=correct 时申请写入的温度"
+    )
+    frozen_sampled_at: str = Field(description="申请时冻结的原读数采样时间")
+    frozen_temperature: float = Field(description="申请时冻结的原读数温度")
+    frozen_revision: int = Field(description="申请时冻结的原读数修订号")
+    status: Literal["pending", "approved", "rejected", "expired"]
+    decided_at: Optional[str] = None
+    decided_reason: Optional[str] = Field(
+        default=None, description="决定请求中附带的说明（驳回理由等）"
+    )
+    expiry_reason: Optional[str] = Field(
+        default=None, description="批准时发现读数已变化、转为过期的具体原因"
+    )
+    execution: Optional[DisputeExecution] = Field(
+        default=None, description="终态争议的首次执行结果；待审争议为 null"
+    )
+    created_at: str
+
+
+class DisputeResponse(BaseModel):
+    dispute: DisputeOut
+
+
+class DisputeListResponse(BaseModel):
+    device_id: str
+    disputes: List[DisputeOut]

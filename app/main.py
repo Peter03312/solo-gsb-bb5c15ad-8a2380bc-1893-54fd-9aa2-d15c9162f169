@@ -1,4 +1,5 @@
 """冷链运输温度事件核验服务 HTTP API。"""
+import json
 import math
 from contextlib import asynccontextmanager
 from typing import Callable
@@ -12,11 +13,18 @@ from .db import connect, init_db
 from .intervals import compute_intervals, diff_intervals
 from .models import (
     CorrectionIn,
+    DecisionIn,
+    DisputeIn,
+    DisputeListResponse,
+    DisputeResponse,
     IntervalsResponse,
     ReadingIn,
     ReadingsResponse,
 )
 from .util import to_utc_iso, utc_now_iso
+
+# 未引起读数变化的决定（驳回 / 过期）对应的空区间差异
+_EMPTY_CHANGES = {"added": [], "changed": [], "invalidated": []}
 
 
 @asynccontextmanager
@@ -29,10 +37,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="冷链运输温度事件核验服务",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "按设备提交 / 更正 / 撤销温度读数，自动核验并维护超温区间。"
         "连续两次有效读数超过上限即形成超温区间，区间以起点事件号标识。"
+        "另支持按争议号对读数提出更正 / 撤销争议：申请时冻结读数与修订号，"
+        "批准时在同一事务内核对修订号，读数已被改变则争议转为过期。"
     ),
     lifespan=lifespan,
 )
@@ -99,10 +109,33 @@ def _mutate(settings: Settings, device_id: str, op: Callable) -> dict:
 
 def _get_reading(conn, device_id: str, event_no: str):
     return conn.execute(
-        "SELECT event_no, sampled_at, temperature, revoked FROM readings "
+        "SELECT event_no, sampled_at, temperature, revoked, revision FROM readings "
         "WHERE device_id = ? AND event_no = ?",
         (device_id, event_no),
     ).fetchone()
+
+
+def _apply_correction(conn, device_id: str, event_no: str,
+                      sampled_at: str, temperature: float) -> None:
+    """按现有规则执行更正，并使读数修订号 +1。
+
+    直接更正接口与争议批准执行共用同一套写入逻辑。
+    """
+    conn.execute(
+        "UPDATE readings SET sampled_at = ?, temperature = ?, "
+        "updated_at = ?, revision = revision + 1 "
+        "WHERE device_id = ? AND event_no = ?",
+        (sampled_at, temperature, utc_now_iso(), device_id, event_no),
+    )
+
+
+def _apply_revocation(conn, device_id: str, event_no: str) -> None:
+    """按现有规则执行撤销（墓碑标记），并使读数修订号 +1。"""
+    conn.execute(
+        "UPDATE readings SET revoked = 1, updated_at = ?, revision = revision + 1 "
+        "WHERE device_id = ? AND event_no = ?",
+        (utc_now_iso(), device_id, event_no),
+    )
 
 
 # ---------------------------------------------------------------- 写接口
@@ -139,8 +172,9 @@ def submit_reading(
         now = utc_now_iso()
         conn.execute(
             "INSERT INTO readings "
-            "(device_id, event_no, sampled_at, temperature, revoked, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 0, ?, ?)",
+            "(device_id, event_no, sampled_at, temperature, revoked, revision, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 0, 1, ?, ?)",
             (device_id, body.event_no, sampled_at, body.temperature, now, now),
         )
 
@@ -173,11 +207,7 @@ def correct_reading(
                 detail=f"reading '{event_no}' on device '{device_id}' has been revoked "
                 f"and cannot be corrected",
             )
-        conn.execute(
-            "UPDATE readings SET sampled_at = ?, temperature = ?, updated_at = ? "
-            "WHERE device_id = ? AND event_no = ?",
-            (sampled_at, body.temperature, utc_now_iso(), device_id, event_no),
-        )
+        _apply_correction(conn, device_id, event_no, sampled_at, body.temperature)
 
     return _mutate(settings, device_id, op)
 
@@ -201,13 +231,344 @@ def revoke_reading(
             )
         if existing["revoked"]:
             return  # 已撤销：幂等，不产生新的区间变化
-        conn.execute(
-            "UPDATE readings SET revoked = 1, updated_at = ? "
-            "WHERE device_id = ? AND event_no = ?",
-            (utc_now_iso(), device_id, event_no),
-        )
+        _apply_revocation(conn, device_id, event_no)
 
     return _mutate(settings, device_id, op)
+
+
+# ---------------------------------------------------------------- 争议工作流
+
+def _get_dispute(conn, device_id: str, dispute_no: str):
+    return conn.execute(
+        "SELECT * FROM disputes WHERE device_id = ? AND dispute_no = ?",
+        (device_id, dispute_no),
+    ).fetchone()
+
+
+def _dispute_payload(row) -> dict:
+    """把争议行转为响应对象；执行结果从 JSON 存档中原样解析。"""
+    return {
+        "device_id": row["device_id"],
+        "dispute_no": row["dispute_no"],
+        "target_event_no": row["target_event_no"],
+        "action": row["action"],
+        "reason": row["reason"],
+        "target_sampled_at": row["target_sampled_at"],
+        "target_temperature": row["target_temperature"],
+        "frozen_sampled_at": row["frozen_sampled_at"],
+        "frozen_temperature": row["frozen_temperature"],
+        "frozen_revision": row["frozen_revision"],
+        "status": row["status"],
+        "decided_at": row["decided_at"],
+        "decided_reason": row["decided_reason"],
+        "expiry_reason": row["expiry_reason"],
+        "execution": json.loads(row["execution"]) if row["execution"] else None,
+        "created_at": row["created_at"],
+    }
+
+
+def _dispute_same_request(row, *, action: str, reason: str, target_event_no: str,
+                          target_sampled_at, target_temperature) -> bool:
+    """判断争议申请是否与首次完全同内容（幂等重放判定）。"""
+    return (
+        row["action"] == action
+        and row["reason"] == reason
+        and row["target_event_no"] == target_event_no
+        and row["target_sampled_at"] == target_sampled_at
+        and row["target_temperature"] == target_temperature
+    )
+
+
+@app.post(
+    "/devices/{device_id}/disputes",
+    response_model=DisputeResponse,
+    status_code=201,
+    summary="对读数提出争议（冻结读数与修订号；同号同内容幂等，异内容冲突）",
+)
+def create_dispute(
+    device_id: str,
+    body: DisputeIn,
+    settings: Settings = Depends(get_settings),
+):
+    target_sampled_at = (
+        to_utc_iso(body.sampled_at) if body.action == "correct" else None
+    )
+    target_temperature = (
+        body.temperature if body.action == "correct" else None
+    )
+
+    with connect(settings.db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = _get_dispute(conn, device_id, body.dispute_no)
+            if existing is not None:
+                if _dispute_same_request(
+                    existing,
+                    action=body.action,
+                    reason=body.reason,
+                    target_event_no=body.target_event_no,
+                    target_sampled_at=target_sampled_at,
+                    target_temperature=target_temperature,
+                ):
+                    # 同号同内容重放：不新建、不重复冻结，返回首次申请（200）
+                    payload = _dispute_payload(existing)
+                    conn.commit()
+                    return JSONResponse(
+                        status_code=200,
+                        content={"dispute": payload},
+                    )
+                conn.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"dispute_no '{body.dispute_no}' already exists on device "
+                        f"'{device_id}' with different content"
+                    ),
+                )
+
+            reading = _get_reading(conn, device_id, body.target_event_no)
+            if reading is None:
+                # 目标不存在：没有可冻结的依据，拒绝申请
+                conn.rollback()
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"target reading '{body.target_event_no}' not found on device "
+                        f"'{device_id}'"
+                    ),
+                )
+            if reading["revoked"]:
+                # 目标已撤销：撤销终态不可再争议更正 / 撤销
+                conn.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"target reading '{body.target_event_no}' on device "
+                        f"'{device_id}' has been revoked and cannot be disputed"
+                    ),
+                )
+
+            now = utc_now_iso()
+            conn.execute(
+                "INSERT INTO disputes ("
+                "device_id, dispute_no, target_event_no, action, reason, "
+                "target_sampled_at, target_temperature, "
+                "frozen_sampled_at, frozen_temperature, frozen_revision, "
+                "status, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                (
+                    device_id,
+                    body.dispute_no,
+                    body.target_event_no,
+                    body.action,
+                    body.reason,
+                    target_sampled_at,
+                    target_temperature,
+                    reading["sampled_at"],
+                    reading["temperature"],
+                    reading["revision"],
+                    now,
+                ),
+            )
+            row = _get_dispute(conn, device_id, body.dispute_no)
+            payload = _dispute_payload(row)
+            conn.commit()
+        except HTTPException:
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+    return {"dispute": payload}
+
+
+@app.post(
+    "/devices/{device_id}/disputes/{dispute_no}/decisions",
+    response_model=DisputeResponse,
+    summary="对待审争议作出决定（批准 / 驳回；同决定重放首次结果，反向决定冲突）",
+)
+def decide_dispute(
+    device_id: str,
+    dispute_no: str,
+    body: DecisionIn,
+    settings: Settings = Depends(get_settings),
+):
+    with connect(settings.db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = _get_dispute(conn, device_id, dispute_no)
+            if row is None:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"dispute '{dispute_no}' not found on device '{device_id}'"
+                    ),
+                )
+
+            if row["status"] != "pending":
+                # 争议只有一个终态：同决定重试返回首次结果，反向决定冲突
+                same = (
+                    (body.decision == "approve" and row["status"] in ("approved", "expired"))
+                    or (body.decision == "reject" and row["status"] == "rejected")
+                )
+                conn.rollback()
+                if same:
+                    return {"dispute": _dispute_payload(row)}
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"dispute '{dispute_no}' is already in terminal state "
+                        f"'{row['status']}'; reverse decision '{body.decision}' is not allowed"
+                    ),
+                )
+
+            decided_at = utc_now_iso()
+
+            if body.decision == "reject":
+                # 驳回：不改动任何读数，记录驳回理由；区间差异为空
+                execution = {
+                    "outcome": "rejected",
+                    "applied": False,
+                    "detail": body.reason,
+                    "intervals": [],
+                    "changes": _EMPTY_CHANGES,
+                }
+                conn.execute(
+                    "UPDATE disputes SET status = 'rejected', decided_at = ?, "
+                    "decided_reason = ?, expiry_reason = NULL, execution = ? "
+                    "WHERE device_id = ? AND dispute_no = ?",
+                    (
+                        decided_at,
+                        body.reason,
+                        json.dumps(execution, ensure_ascii=False),
+                        device_id,
+                        dispute_no,
+                    ),
+                )
+            else:  # approve：同一事务内核对冻结修订号
+                reading = _get_reading(conn, device_id, row["target_event_no"])
+                expired_reason = None
+                if reading is None:
+                    expired_reason = (
+                        f"target reading '{row['target_event_no']}' no longer exists; "
+                        f"frozen revision was {row['frozen_revision']}"
+                    )
+                elif reading["revoked"] != 0:
+                    expired_reason = (
+                        f"target reading '{row['target_event_no']}' has been revoked "
+                        f"(current revision {reading['revision']}) since the dispute "
+                        f"was frozen at revision {row['frozen_revision']}"
+                    )
+                elif reading["revision"] != row["frozen_revision"]:
+                    # 即使现值恰好与目标一致也算过期：修订号变了即不再核对内容
+                    expired_reason = (
+                        f"target reading '{row['target_event_no']}' revision changed "
+                        f"from {row['frozen_revision']} to {reading['revision']} "
+                        f"before approval"
+                    )
+
+                if expired_reason is not None:
+                    # 过期：保留原因，不再改读数
+                    execution = {
+                        "outcome": "expired",
+                        "applied": False,
+                        "detail": expired_reason,
+                        "intervals": [],
+                        "changes": _EMPTY_CHANGES,
+                    }
+                    conn.execute(
+                        "UPDATE disputes SET status = 'expired', decided_at = ?, "
+                        "decided_reason = ?, expiry_reason = ?, execution = ? "
+                        "WHERE device_id = ? AND dispute_no = ?",
+                        (
+                            decided_at,
+                            body.reason,
+                            expired_reason,
+                            json.dumps(execution, ensure_ascii=False),
+                            device_id,
+                            dispute_no,
+                        ),
+                    )
+                else:
+                    # 仍匹配冻结依据：按现有规则执行更正或撤销，记录当次区间差异
+                    before = _current_intervals(
+                        conn, device_id, settings.temp_limit
+                    )
+                    if row["action"] == "correct":
+                        _apply_correction(
+                            conn,
+                            device_id,
+                            row["target_event_no"],
+                            row["target_sampled_at"],
+                            row["target_temperature"],
+                        )
+                    else:
+                        _apply_revocation(
+                            conn, device_id, row["target_event_no"]
+                        )
+                    after = _current_intervals(
+                        conn, device_id, settings.temp_limit
+                    )
+                    execution = {
+                        "outcome": "applied",
+                        "applied": True,
+                        "detail": None,
+                        "intervals": after,
+                        "changes": diff_intervals(before, after),
+                    }
+                    conn.execute(
+                        "UPDATE disputes SET status = 'approved', decided_at = ?, "
+                        "decided_reason = ?, expiry_reason = NULL, execution = ? "
+                        "WHERE device_id = ? AND dispute_no = ?",
+                        (
+                            decided_at,
+                            body.reason,
+                            json.dumps(execution, ensure_ascii=False),
+                            device_id,
+                            dispute_no,
+                        ),
+                    )
+
+            row = _get_dispute(conn, device_id, dispute_no)
+            payload = _dispute_payload(row)
+            conn.commit()
+        except HTTPException:
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+    return {"dispute": payload}
+
+
+@app.get(
+    "/devices/{device_id}/disputes",
+    response_model=DisputeListResponse,
+    summary="查询设备全部争议（含冻结依据、终态与执行结果）",
+)
+def list_disputes(device_id: str, settings: Settings = Depends(get_settings)):
+    with connect(settings.db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM disputes WHERE device_id = ? ORDER BY created_at, dispute_no",
+            (device_id,),
+        ).fetchall()
+    return {"device_id": device_id, "disputes": [_dispute_payload(r) for r in rows]}
+
+
+@app.get(
+    "/devices/{device_id}/disputes/{dispute_no}",
+    response_model=DisputeResponse,
+    summary="按争议号查询争议详情（未知争议号报错 404）",
+)
+def get_dispute(device_id: str, dispute_no: str,
+                settings: Settings = Depends(get_settings)):
+    with connect(settings.db_path) as conn:
+        row = _get_dispute(conn, device_id, dispute_no)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"dispute '{dispute_no}' not found on device '{device_id}'",
+        )
+    return {"dispute": _dispute_payload(row)}
 
 
 # ---------------------------------------------------------------- 查询接口
@@ -263,7 +624,7 @@ def health():
 def root(settings: Settings = Depends(get_settings)):
     return {
         "service": "coldchain-temperature-verification",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "temp_limit": settings.temp_limit,
         "docs": "/docs",
     }

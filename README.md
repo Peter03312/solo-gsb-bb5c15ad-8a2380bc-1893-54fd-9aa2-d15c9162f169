@@ -4,6 +4,10 @@
 服务自动核验并维护**超温区间**；支持迟到补报、按事件号更正与撤销，并在每次写操作后
 重算受影响区间，返回当前全量区间及本次新增 / 变更 / 失效的区间差异。
 
+此外支持**读数争议工作流**：对现有读数按争议号提出“更正采样时间与温度”或“撤销”，
+申请时冻结读数内容与**修订号**；待审争议可批准或驳回，批准时在同一事务内核对修订号，
+读数若已被直接操作或其他争议改变，争议转为**过期**且不再改读数。
+
 ## 超温区间判定规则
 
 - 同一设备的**有效**（未撤销）读数按 **(采样时间, 事件号)** 升序排列；
@@ -67,6 +71,10 @@ Compose 中通过 `environment` 修改，例如 `TEMP_LIMIT: "2.0"`。
 | DELETE | `/devices/{device_id}/readings/{event_no}` | 按事件号撤销读数（重复撤销幂等）        |
 | GET    | `/devices/{device_id}/intervals`        | 查询当前全部超温区间                       |
 | GET    | `/devices/{device_id}/readings`         | 查询全部读数（含已撤销），按规则排序       |
+| POST   | `/devices/{device_id}/disputes`         | 提出争议（冻结读数与修订号）               |
+| POST   | `/devices/{device_id}/disputes/{dispute_no}/decisions` | 批准 / 驳回待审争议     |
+| GET    | `/devices/{device_id}/disputes`         | 查询设备全部争议                           |
+| GET    | `/devices/{device_id}/disputes/{dispute_no}` | 查询单个争议（未知争议号 404）        |
 | GET    | `/health`                               | 健康检查                                   |
 
 ### 请求字段
@@ -135,14 +143,153 @@ curl $BASE/readings
 补交一条更早的超限读数 `E1(08:00, 8.5)` 后，响应中 `changes.invalidated` 含旧区间
 `E2`、`changes.added` 含新区间 `E1`（起点改变 → 旧失效、新新增）。
 
+## 读数争议工作流
+
+### 数据模型：修订号
+
+每条读数带单调递增的**修订号** `revision`：提交时为 `1`，此后每次更正 / 撤销
+（无论来自直接的 `PUT` / `DELETE`，还是争议被**批准执行**）都 `+1`。
+修订号是争议能否执行的唯一判据，与读数当前内容无关。
+
+### 状态机
+
+```
+                POST /disputes（冻结 sampled_at/temperature/revision）
+   (不存在) ────────────────────────────────►  pending
+                                                  │
+                          decision=reject         │         decision=approve
+                        ┌─────────────────────────┴─────────────────────────┐
+                        ▼                                                   ▼
+                    rejected                        revision 仍匹配 → approved（执行更正/撤销）
+            （不改读数）                            revision 已变   → expired（不改读数，保留原因）
+```
+
+- 争议**只能进入一个终态**；
+- 对终态争议重放**同一决定**：返回首次结果（含首次执行结果与区间差异），不重复执行；
+- 对终态争议发起**反向决定**：`409 Conflict`；
+- 批准过期争议后状态为 `expired`（终态），对它重放 `approve` 返回首次过期结果，
+  再发 `reject` 属于反向决定，`409`。
+
+### 申请争议 `POST /devices/{device_id}/disputes`
+
+请求体：
+
+| 字段              | 说明                                                        |
+| ----------------- | ----------------------------------------------------------- |
+| `dispute_no`      | 设备内唯一争议号（规则同事件号，≤ 64 字符）                 |
+| `target_event_no` | 被争议读数的事件号，**必须存在且未撤销**（否则 404 / 409）  |
+| `action`          | `correct`（更正采样时间与温度）或 `revoke`（撤销）          |
+| `reason`          | **非空**原因（1–1000 字符，不能全为空白）                   |
+| `sampled_at`      | `action=correct` 时**必填**；`revoke` 时必须缺省            |
+| `temperature`     | `action=correct` 时**必填**（同温度校验）；`revoke` 时缺省  |
+
+- 首次成功：`201 Created`，响应中 `dispute.status = "pending"`，并带回冻结依据
+  `frozen_sampled_at` / `frozen_temperature` / `frozen_revision`；
+- **同号同内容**重试（时间支持等价时区表示）：`200` 且原样返回首次申请，
+  不重复冻结；
+- **同号异内容**（动作、目标读数、原因、目标时间 / 温度任一不同）：`409`；
+- 同一读数可同时存在多个待审争议，先被批准的会改变修订号，使后批准者过期。
+
+### 作出决定 `POST .../disputes/{dispute_no}/decisions`
+
+请求体：`{"decision": "approve" | "reject", "reason": "可选说明"}`。
+
+- **驳回**：读数与区间均不变，`status = "rejected"`，
+  `execution.outcome = "rejected"`、`applied = false`、`changes` 三个列表为空；
+- **批准且仍匹配冻结修订号**：在**同一事务**内执行更正 / 撤销（走与直接接口相同的
+  现有规则），`status = "approved"`、`execution.outcome = "applied"`、
+  `applied = true`，并返回 `execution.intervals`（决定时点全量区间）与
+  `execution.changes`（**当次**区间差异：`added` / `changed` / `invalidated`）；
+- **批准时已不匹配**（读数被直接更正 / 撤销，或被其他争议改变）：
+  `status = "expired"`、`execution.outcome = "expired"`、`applied = false`、
+  `changes` 为空，`expiry_reason` 记录修订号变化（如 `1 → 2`）；
+  **即使读数当前内容恰好与申请目标相同，也判定过期，不再写入。**
+
+### 查询争议
+
+- `GET /devices/{device_id}/disputes` → `{"device_id", "disputes":[...]}`，
+  按创建时间、争议号排序；
+- `GET /devices/{device_id}/disputes/{dispute_no}` → 单个争议；未知争议号 `404`。
+
+争议对象包含三部分信息：
+
+1. **冻结依据**：`target_event_no` / `action` / `reason` /
+   `target_sampled_at` / `target_temperature`（申请内容）+
+   `frozen_sampled_at` / `frozen_temperature` / `frozen_revision`（申请时快照）；
+2. **终态**：`status`（`pending` / `approved` / `rejected` / `expired`）、
+   `decided_at`、`decided_reason`、`expiry_reason`；
+3. **执行结果**：`execution`（待审时为 `null`），结构见上。
+
+### 争议接口示例
+
+```bash
+BASE=http://localhost:8000/devices/truck-001
+
+# 1. 提交两条超限读数，形成起点 E1 的区间
+curl -X POST $BASE/readings -H 'Content-Type: application/json' \
+  -d '{"event_no":"E1","sampled_at":"2026-10-01T08:00:00Z","temperature":9.0}'
+curl -X POST $BASE/readings -H 'Content-Type: application/json' \
+  -d '{"event_no":"E2","sampled_at":"2026-10-01T08:10:00Z","temperature":9.5}'
+
+# 2. 提出更正争议：申请把 E2 改为 5.0（冻结到 revision=1）
+curl -X POST $BASE/disputes -H 'Content-Type: application/json' -d '{
+  "dispute_no":"D1",
+  "target_event_no":"E2",
+  "action":"correct",
+  "reason":"sensor calibration drift; recalibrated probe",
+  "sampled_at":"2026-10-01T08:10:00Z",
+  "temperature":5.0
+}'
+
+# 3. 同号同内容重放 → 200，返回原申请（等价时区也算同内容）
+curl -X POST $BASE/disputes -H 'Content-Type: application/json' -d '{
+  "dispute_no":"D1","target_event_no":"E2","action":"correct",
+  "reason":"sensor calibration drift; recalibrated probe",
+  "sampled_at":"2026-10-01T16:10:00+08:00","temperature":5.0}'
+
+# 4a. 批准（读数未变）：执行更正，E1 区间失效，execution.changes.invalidated 含 E1
+curl -X POST $BASE/disputes/D1/decisions -H 'Content-Type: application/json' \
+  -d '{"decision":"approve","reason":"evidence confirmed"}'
+
+# 4b. 或者驳回：读数与区间均不变
+curl -X POST $BASE/disputes/D1/decisions -H 'Content-Type: application/json' \
+  -d '{"decision":"reject","reason":"calibration log valid"}'
+
+# 5. 过期场景：争议悬而未决时读数被直接操作（修订号变化），再批准 → expired
+curl -X PUT $BASE/readings/E2 -H 'Content-Type: application/json' \
+  -d '{"sampled_at":"2026-10-01T08:10:00Z","temperature":5.0}'
+curl -X POST $BASE/disputes/D1/decisions -H 'Content-Type: application/json' \
+  -d '{"decision":"approve"}'
+# → status="expired", applied=false, expiry_reason 说明 revision 1 → 2
+
+# 6. 撤销型争议（不得带 sampled_at / temperature）
+curl -X POST $BASE/disputes -H 'Content-Type: application/json' -d '{
+  "dispute_no":"D2","target_event_no":"E1","action":"revoke",
+  "reason":"duplicate packet from gateway retry"}'
+curl -X POST $BASE/disputes/D2/decisions -H 'Content-Type: application/json' \
+  -d '{"decision":"approve"}'
+
+# 7. 查询
+curl $BASE/disputes                 # 全部争议
+curl $BASE/disputes/D1              # 单个争议（含冻结依据、终态、执行结果）
+```
+
+### 兼容性
+
+- 原有读数与区间接口的**请求、响应与幂等语义完全不变**（仅内部新增 `revision` 列，
+  不在原读数 / 区间响应中暴露）；
+- 升级旧版本数据库时自动幂等迁移：旧读数补列 `revision = 1`，无需手工脚本，
+  现有 `uvicorn app.main:app` 启动方式保持可用。
+
 ## 错误码
 
 | 状态码 | 场景                                                                 |
 | ------ | -------------------------------------------------------------------- |
-| 200    | 成功（含幂等重放、重复撤销）                                         |
-| 404    | 更正 / 撤销的事件号不存在                                            |
-| 409    | 同事件号提交不同内容；更正已撤销的读数                               |
-| 422    | 无效时间格式、无效温度（非数值 / 无穷 / 超范围）、非法事件号         |
+| 200    | 成功（含幂等重放、重复撤销、争议同内容重放 / 终态同决定重试）        |
+| 201    | 争议首次申请成功                                                     |
+| 404    | 更正 / 撤销的事件号不存在；争议目标读数不存在；查询 / 决定未知争议号 |
+| 409    | 同事件号提交不同内容；更正已撤销读数；争议目标已撤销；同争议号异内容；对终态争议发反向决定 |
+| 422    | 无效时间格式、无效温度（非数值 / 无穷 / 超范围）、非法事件号；争议原因缺失 / 空白；`correct` 缺目标值或 `revoke` 带目标值 |
 
 错误响应体均含 `detail` 字段说明原因。
 
@@ -157,12 +304,14 @@ pytest -q
 
 ```
 app/
-  main.py       # FastAPI 路由、事务内重算区间、错误处理
+  main.py       # FastAPI 路由、事务内重算区间、争议工作流、错误处理
   intervals.py  # 区间计算与差异比对（纯函数）
-  models.py     # 请求/响应模型与输入校验
-  db.py         # SQLite 连接与建表
+  models.py     # 请求/响应模型与输入校验（含争议申请 / 决定模型）
+  db.py         # SQLite 连接、建表与旧库 revision 增量迁移
   config.py     # 环境变量配置
   util.py       # 时间规范化（UTC、固定宽度，保证可排序）
-tests/test_api.py
+tests/
+  test_api.py       # 原读数 / 区间接口测试（语义不变）
+  test_disputes.py  # 争议工作流测试（冻结、批准 / 驳回、过期、幂等、迁移）
 Dockerfile / docker-compose.yml / requirements*.txt
 ```
